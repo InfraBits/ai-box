@@ -144,5 +144,5 @@ fi
 exec "$@"'
 
 printf '\033]0;%s-box - %s\007' "$mode" "$dir_name"
-podman run --rm -ti "${podman_args[@]}" ghcr.io/infrabits/ai-box:main \
+podman run --rm -ti "${podman_args[@]}" ghcr.io/infrabits/ai-box:v1.0.0 \
 -c "$container_script" -- "$entrypoint" "${tool_args[@]}" "$@"
