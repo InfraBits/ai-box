@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+dir_name=$(basename "$(pwd)")
+
+mode=$1
+if [[ "$(basename "$0")" == "claude-box" ]]; then mode="claude"; fi
+if [[ "$(basename "$0")" == "codex-box" ]]; then mode="codex"; fi
+if [[ "$mode" != "claude" ]] && [[ "$mode" != "codex" ]]; then echo "Unknown mode"; exit 1; fi
+
+bootstrap_python_venv=0
+if [[ -f "ve/bin/activate" ]] || [[ -f "pyproject.toml" ]]; then bootstrap_python_venv=1; fi
+persist_python_venv=0
+proxy_mysql=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bootstrap-python) bootstrap_python_venv=1; shift ;;
+    --persist-virtualenv) persist_python_venv=1; shift ;;
+    --no-bootstrap-python) bootstrap_python_venv=0; shift ;;
+    --mysql) proxy_mysql=1; shift ;;
+    --no-mysql) proxy_mysql=0; shift ;;
+    *) break ;;
+  esac
+done
+
+container_name="codex-box-$(tr -c 'a-zA-Z0-9_.-' '_' <<< "$dir_name")-$$"
+container_home="/home/developer"
+entrypoint=""
+
+command_args=()
+
+podman_args=()
+podman_args+=(--name "${container_name}")
+podman_args+=(--userns=keep-id:uid=1000,gid=1000)
+podman_args+=(--cap-drop=ALL)
+podman_args+=(--security-opt=no-new-privileges)
+podman_args+=(--pids-limit=1024)
+
+podman_args+=(--env "TERM=${TERM:-xterm-256color}")
+if [[ -n "${COLORTERM}" ]]; then podman_args+=(--env COLORTERM); fi
+if [[ -n "${TERM_PROGRAM}" ]]; then podman_args+=(--env TERM_PROGRAM); fi
+if [[ -n "${TMUX}" ]]; then podman_args+=(--env TMUX); fi
+if [[ -n "${STY}" ]]; then podman_args+=(--env STY); fi
+
+podman_args+=(-v "$(pwd):/workspace:rw,Z")
+podman_args+=(-w /workspace)
+
+if [[ "$mode" == "claude" ]];
+then
+  entrypoint="/home/developer/.local/bin/claude"
+
+  if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]] && [[ "$(uname -s)" == "Darwin" ]];
+  then
+    claude_credentials=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    if [[ -n "${claude_credentials}" ]];
+    then
+      export CLAUDE_CODE_OAUTH_TOKEN=$(jq -r '.claudeAiOauth.accessToken' <<< "${claude_credentials}")
+    fi
+  fi
+
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN}" ]];
+  then
+    podman_args+=(--env CLAUDE_CODE_OAUTH_TOKEN)
+  fi
+
+  # Mount the config files into the container
+  if [[ -d "$HOME/.claude" ]];
+  then
+    podman_args+=(-v "$HOME/.claude:${container_home}/.claude:rw,z")
+  fi
+
+  if [[ -f "$HOME/.claude.json" ]];
+  then
+    podman_args+=(-v "$HOME/.claude.json:${container_home}/.claude.json:ro,z")
+  fi
+fi
+
+if [[ "$mode" == "codex" ]];
+then
+  entrypoint="/home/developer/node_modules/.bin/codex"
+  run_podman_args+=(--no-daemon --sandbox danger-full-access)
+
+  # Mount the config files into the container
+  if [[ -d "$HOME/.codex" ]];
+  then
+    podman_args+=(-v "$HOME/.codex:${container_home}/.codex:rw,z")
+  fi
+fi
+
+# Reuse a persistent project venv when requested or when one already exists.
+venv_volume="ai-box-venv-$(printf '%s' "$(pwd)" | cksum | awk '{print $1}')"
+if podman volume exists "$venv_volume";
+then
+  echo "Re-using existing virtual env: $venv_volume"
+  persist_python_venv=1
+  bootstrap_python_venv=1
+fi
+
+# Mount the volume into our workspace
+if [[ "$persist_python_venv" == "1" ]];
+then
+  podman_args+=(-v "${venv_volume}:/workspace/ve:Z")
+fi
+
+# Don't pass our local virtual env into the container, put an empty directory there instead
+if [[ -f "ve/bin/activate" ]] && [[ "$persist_python_venv" != "1" ]];
+then
+  podman_args+=(--tmpfs /workspace/ve:mode=1777,notmpcopyup)
+fi
+
+# Pass our git config into the container, but strip our local references
+git_config=$(mktemp)
+trap 'rm -f "$git_config"' EXIT
+
+if [[ -f "$HOME/.gitconfig" ]];
+then
+  sed '/signingkey = /d' "$HOME/.gitconfig" > "$git_config"
+fi
+
+git config --file "$git_config" --add safe.directory /workspace
+podman_args+=(-v "$git_config:${container_home}/.gitconfig:ro,z")
+
+# Pass our global git ignore into the container
+if [[ -f "$HOME/.gitignore" ]];
+then
+  git config --file "$git_config" --replace-all core.excludesfile "${container_home}/.gitignore"
+  podman_args+=(-v "$HOME/.gitignore:${container_home}/.gitignore:ro,z")
+fi
+
+# Pass our known ssh keys into the container
+if [[ -f "$HOME/.ssh/known_hosts" ]];
+then
+  podman_args+=(-v "$HOME/.ssh/known_hosts:${container_home}/.ssh/known_hosts:ro,z")
+fi
+
+if [[ -n "$entrypoint" ]];
+then
+  podman_args+=(--entrypoint /bin/sh)
+  run_podman_args=(
+    -c 'set -e
+       if [[ "'${proxy_mysql}'" == "1" ]];
+       then
+         socat TCP4-LISTEN:3306,bind=127.0.0.1,reuseaddr,fork "TCP4:host.containers.internal:3306" &
+       fi
+       if [[ "'${bootstrap_python_venv}'" == "1" ]];
+       then
+         export VIRTUAL_ENV=/workspace/ve
+         export PATH="$VIRTUAL_ENV/bin:$PATH"
+         if [[ ! -x /workspace/ve/bin/python ]];
+         then
+           python3 -m venv /workspace/ve
+           if [[ -f /workspace/pyproject.toml ]];
+           then
+             poetry install --no-interaction
+           fi
+         fi
+       fi
+       exec "$@"' -- "$entrypoint" "${run_podman_args[@]}" "$@"
+  )
+else
+  run_podman_args+=("$@")
+fi
+
+printf '\033]0;%s-box - %s\007' "$mode" "$(basename $(pwd))"
+podman run --rm -ti "${podman_args[@]}" ghcr.io/infrabits/ai-box:main "${run_podman_args[@]}"
