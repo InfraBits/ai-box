@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+dir_name=$(basename "$(pwd)")
+
+mode=$1
+if [[ -z "$mode" ]] && [[ "$(basename "$0")" == "claude-box" ]]; then mode="claude"; fi
+if [[ -z "$mode" ]] && [[ "$(basename "$0")" == "codex-box" ]]; then mode="codex"; fi
+if [[ "$mode" != "claude" ]] && [[ "$mode" != "codex" ]]; then echo "Unknown mode"; exit 1; fi
+
+container_home="/home/developer"
+entrypoint=""
+
+command_args=()
+
+podman_args=()
+podman_args+=(--name "codex-box-$(tr -c 'a-zA-Z0-9_.-' '_' <<< "$dir_name")-$$")
+podman_args+=(--userns=keep-id:uid=1000,gid=1000)
+podman_args+=(--cap-drop=ALL)
+podman_args+=(--security-opt=no-new-privileges)
+podman_args+=(--pids-limit=1024)
+podman_args+=(-v "$(pwd):/workspace:rw,Z")
+podman_args+=(-w /workspace)
+podman_args+=(--env "TERM=${TERM:-xterm-256color}")
+
+if [[ "$mode" == "claude" ]];
+then
+  entrypoint="/home/developer/.local/bin/claude"
+
+  if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]];
+  then
+    claude_credentials=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    if [[ -n "${claude_credentials}" ]];
+    then
+      export CLAUDE_CODE_OAUTH_TOKEN=$(jq -r '.claudeAiOauth.accessToken' <<< "${claude_credentials}")
+      podman_args+=(--env CLAUDE_CODE_OAUTH_TOKEN)
+    fi
+  fi
+
+  # Mount the config files into the container
+  if [[ -d "$HOME/.claude" ]];
+  then
+    podman_args+=(-v "$HOME/.claude:${container_home}/.claude:rw,z")
+  fi
+
+  if [[ -f "$HOME/.claude.json" ]];
+  then
+    podman_args+=(-v "$HOME/.claude.json:${container_home}/.claude.json:ro,z")
+  fi
+fi
+
+if [[ "$mode" == "codex" ]];
+then
+  entrypoint="/home/developer/node_modules/.bin/codex"
+  run_podman_args+=(--no-daemon --sandbox danger-full-access)
+
+  # Mount the config files into the container
+  if [[ -d "$HOME/.codex" ]];
+  then
+    podman_args+=(-v "$HOME/.codex:${container_home}/.codex:rw,z")
+  fi
+fi
+
+# Don't pass our local virtual env into the container, put an empty directory there instead
+if [[ -x "ve/bin/activate" ]];
+then
+  podman_args+=(--mount type=tmpfs,destination=/workspace/ve)
+fi
+
+# Pass our git config into the container, but strip our references to local keys
+if [[ -f "$HOME/.gitconfig" ]];
+then
+  git_config=$(mktemp)
+  trap 'rm -f "$git_config"' EXIT
+  sed '/signingkey = /d' "$HOME/.gitconfig" > "$git_config"
+  podman_args+=(-v "$git_config:${container_home}/.gitconfig:ro,z")
+fi
+
+# Pass our global git ignore into the container
+if [[ -f "$HOME/.gitignore" ]];
+then
+  podman_args+=(-v "$HOME/.gitignore:${container_home}/.gitignore:ro,z")
+fi
+
+# Pass our known ssh keys into the container
+if [[ -f "$HOME/.ssh/known_hosts" ]];
+then
+  podman_args+=(-v "$HOME/.ssh/known_hosts:${container_home}/.ssh/known_hosts:ro,z")
+fi
+
+if [[ -n "$entrypoint" ]];
+then
+  podman_args+=(--entrypoint $entrypoint)
+fi
+
+exec podman run --rm -ti "${podman_args[@]}" ghcr.io/infrabits/ai-box:main "${run_podman_args[@]}" "$@"
